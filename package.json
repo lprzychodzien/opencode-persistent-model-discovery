@@ -1,0 +1,29 @@
+{
+  "name": "opencode-persistent-model-discovery",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that persistently discovers and caches AI models from OpenAI-compatible providers",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lprzychodzien/opencode-persistent-model-discovery"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "model-discovery",
+    "openai-compatible",
+    "ai-models"
+  ],
+  "author": "Lukasz Przychodzien",
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest"
+  },
+  "opencode": {
+    "plugin": true
+  }
+}

@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Cache files (should not be committed)
+cache/
+*.cache
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test files
+test/
+tests/
+coverage/
+
+# Build artifacts
+dist/
+build/
+*.tgz
+
+# Environment
+.env
+.env.local
+
+# Temporary files
+tmp/
+temp/
