@@ -25,34 +25,68 @@ This means models are always available immediately, while staying up-to-date in 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   opencode.json │     │   Cache File     │     │   Provider API  │
-│   (Config)      │     │   (~/.cache/...)│     │   (/v1/models) │
-└────────┬────────┘     └────────┬─────────┘     └────────┬────────┘
-         │                       │                        │
-         │  Provider settings    │  Discovered models     │  Fresh models
-         │  (baseURL, etc)       │  (from last sync)      │  (current)
-         │                       │                        │
-         └───────────┬───────────┴────────────┬───────────┘
-                     │                          │
-                     ▼                          │
-         ┌─────────────────────┐                 │
-         │  Persistent Model   │◄────────────────┘
-         │  Discovery Plugin   │  Async refresh
-         │                     │  (after startup)
-         └─────────────────────┘
-                     │
-         ┌───────────┴───────────┐
-         │                       │
-         ▼                       ▼
-┌─────────────────┐    ┌──────────────────┐
-│  Phase 1: Load  │    │  Phase 2: Fetch  │
-│  cache sync     │    │  API async       │
-│                 │    │                  │
-│  Before provider│    │  After startup   │
-│  resolution     │    │  Update cache    │
-└─────────────────┘    └──────────────────┘
+              ┌──────────────────────────────────────────────────────┐
+              │              OpenCode Startup Lifecycle              │
+              └──────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+                                ┌──────────────────┐
+                                │   config() hook  │
+                                │      fires       │
+                                └────────┬─────────┘
+                                         │
+              ┌──────────────────────────┼──────────────────────────┐
+              │                          │                          │
+              ▼                          ▼                          ▼
+     ┌──────────────┐           ┌──────────────┐           ┌──────────────┐
+     │ opencode.json│           │  Cache File  │           │ Provider API │
+     │              │           │ ~/.cache/    │           │ {baseURL}/   │
+     │ • baseURL    │           │ opencode/    │           │   models     │
+     │ • apiKey     │           │models-*.json │           │              │
+     └──────┬───────┘           └──────┬───────┘           └──────┬───────┘
+            │                          │                          │
+            │  provider settings       │  cached models           │  fresh models
+            │  (baseURL, apiKey)       │  (from last sync)        │  (current)
+            │                          │                          │
+            └────────────┬─────────────┴─────────────┬────────────┘
+                         │                           │
+                         ▼                           │
+              ┌──────────────────────┐               │
+              │   Phase 1: Cache     │               │
+              │       Load           │               │
+              │                      │               │
+              │  Read cache file     │               │
+              │  Merge into          │               │
+              │   p.models           │               │
+              │  (immediate)         │               │
+              └──────────┬───────────┘               │
+                         │                           │
+                         ▼                           │
+              ┌──────────────────────┐               │
+              │   Phase 2: API       │◀──────────────┘
+              │      Refresh         │
+              │                      │
+              │  Fetch /v1/models    │
+              │  Write to cache      │──────▶ cache file
+              │  Merge into          │
+              │   p.models           │
+              │  (current session)   │
+              └──────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │  config() returns    │
+              │  (models merged)     │
+              └──────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │  Provider Resolution │
+              │  (models ready ✅)   │
+              └──────────────────────┘
 ```
+
+Both phases run inside OpenCode's `config` hook. Phase 1 awaits the cache read so models are merged into `provider.{name}.models` before the hook returns, and Phase 2 awaits the API fetch plus cache write in the same hook. By the time OpenCode validates the requested model, both cached and freshly discovered entries are already in `p.models`, eliminating the race condition.
 
 ## Installation
 
