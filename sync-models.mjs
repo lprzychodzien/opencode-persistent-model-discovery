@@ -31,13 +31,50 @@ function getCacheDir() {
   return path.join(os.homedir(), '.cache', 'opencode')
 }
 
-const CONFIG_FILE = path.join(getConfigDir(), 'opencode.json')
+const CONFIG_CANDIDATES = ['opencode.jsonc', 'opencode.json', 'config.json'].map((name) =>
+  path.join(getConfigDir(), name),
+)
 const AUTH_FILE = path.join(getDataDir(), 'auth.json')
+
+// Strip // and /* */ comments and trailing commas, leaving string contents intact
+function stripJSONC(text) {
+  let out = ''
+  let inString = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      out += ch
+      if (ch === '\\') out += text[++i] ?? ''
+      else if (ch === '"') inString = false
+    } else if (ch === '"') {
+      inString = true
+      out += ch
+    } else if (ch === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i++
+      out += '\n'
+    } else if (ch === '/' && text[i + 1] === '*') {
+      i += 2
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++
+      i++
+    } else {
+      out += ch
+    }
+  }
+  return out.replace(/,(\s*[}\]])/g, '$1')
+}
+
+async function loadConfig() {
+  for (const file of CONFIG_CANDIDATES) {
+    const config = await loadJSON(file)
+    if (config) return { config, file }
+  }
+  return { config: null, file: CONFIG_CANDIDATES.join(', ') }
+}
 
 async function loadJSON(filePath) {
   try {
     const content = await fs.readFile(filePath, 'utf8')
-    return JSON.parse(content)
+    return JSON.parse(filePath.endsWith('.jsonc') ? stripJSONC(content) : content)
   } catch (err) {
     if (err.code === 'ENOENT') return null
     throw err
@@ -71,6 +108,8 @@ async function discoverModels(baseURL, apiKey) {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
+        // Some providers (e.g. Surplus) mislabel uncompressed bodies as brotli, breaking decoding
+        'Accept-Encoding': 'identity',
       },
     })
 
@@ -104,9 +143,9 @@ async function main() {
   console.log(`🔍 Model Sync: ${provider}`)
   console.log('=====================\n')
 
-  const config = await loadJSON(CONFIG_FILE)
+  const { config, file: configFile } = await loadConfig()
   if (!config) {
-    console.error(`❌ Config file not found: ${CONFIG_FILE}`)
+    console.error(`❌ Config file not found: ${configFile}`)
     process.exit(1)
   }
 

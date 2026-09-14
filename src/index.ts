@@ -27,6 +27,8 @@ async function discoverModels(baseURL: string, apiKey: string): Promise<Array<{ 
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
+        // Some providers (e.g. Surplus) mislabel uncompressed bodies as brotli, breaking decoding
+        'Accept-Encoding': 'identity',
       },
     })
     
