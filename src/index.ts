@@ -1,163 +1,205 @@
-import type { Plugin, PluginInput } from '@opencode-ai/plugin'
-import { promises as fs } from 'node:fs'
-import path from 'node:path'
-import os from 'node:os'
+// OpenCode Persistent Model Discovery
+//
+// OpenCode 2.x: the default export is a `{ id, setup }` plugin definition. In
+// setup we register a model transform that, for every provider whose settings
+// contain `modelsDiscovery: { enabled: true }`, adds the models from the
+// on-disk cache, then refreshes that cache from `{baseURL}/models` in the
+// background and asks OpenCode to reload models when the list changes.
+//
+// OpenCode 1.x (>= 1.18.29) loads the `server` export instead, which keeps the
+// original `config` hook behaviour.
 
-function getDataDir(): string {
-  const xdgData = process.env.XDG_DATA_HOME
-  if (xdgData) return path.join(xdgData, 'opencode')
-  return path.join(os.homedir(), '.local', 'share', 'opencode')
+import {
+  fetchModels,
+  getAuthKeySync,
+  isChatModel,
+  loadCacheSync,
+  log,
+  saveCache,
+} from './discovery.mjs'
+
+const PLUGIN_ID = 'opencode-persistent-model-discovery'
+const DEFAULT_REFRESH_HOURS = 6
+const RETRY_AFTER_FAILURE_MS = 5 * 60 * 1000
+
+type CachedModel = {
+  id: string
+  name?: string
+  context?: number
+  output?: number
+  tools?: boolean
+  input?: string[]
+  outputModalities?: string[]
+  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number }
+}
+type CachedModels = Record<string, CachedModel>
+
+type DiscoveryOptions = {
+  enabled?: boolean
+  /** How often the background refresh re-fetches `/models` (default 6). */
+  refreshIntervalHours?: number
+  /** Only add models that output text, skipping image/video/audio/embedding models (default false). */
+  textOnly?: boolean
 }
 
-function getCacheDir(): string {
-  const xdgCache = process.env.XDG_CACHE_HOME
-  if (xdgCache) return path.join(xdgCache, 'opencode')
-  return path.join(os.homedir(), '.cache', 'opencode')
+type ProviderState = {
+  models: CachedModels
+  /** Epoch ms when the next background fetch is due (0 = now). */
+  nextAt: number
+  intervalMs: number
+  baseURL: string
+  apiKey?: string
+  inFlight?: Promise<void>
 }
 
-async function discoverModels(baseURL: string, apiKey: string): Promise<Array<{ id: string; name?: string }>> {
-  const url = baseURL.endsWith('/') ? `${baseURL}models` : `${baseURL}/models`
-  
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 10000)
-  
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        // Some providers (e.g. Surplus) mislabel uncompressed bodies as brotli, breaking decoding
-        'Accept-Encoding': 'identity',
+function signature(models: CachedModels): string {
+  return JSON.stringify(Object.keys(models).sort().map((k) => [k, models[k]]))
+}
+
+/** Copy a cached entry onto an OpenCode 2.x Model.Info draft. */
+function applyToDraft(m: any, entry: CachedModel) {
+  m.name = entry.name || entry.id
+  if (entry.context) m.limit.context = entry.context
+  if (entry.output) m.limit.output = entry.output
+  if (m.limit.output > m.limit.context) m.limit.output = m.limit.context
+  if (typeof entry.tools === 'boolean') m.capabilities.tools = entry.tools
+  if (entry.input?.length) m.capabilities.input = [...entry.input]
+  if (entry.outputModalities?.length) m.capabilities.output = [...entry.outputModalities]
+  if (entry.cost) {
+    m.cost = [
+      {
+        input: entry.cost.input,
+        output: entry.cost.output,
+        cache: { read: entry.cost.cacheRead, write: entry.cost.cacheWrite },
       },
-    })
-    
-    clearTimeout(timeoutId)
+    ]
+  }
+}
 
-    if (!response.ok) {
-      throw new Error(`Discovery failed: ${response.status} ${response.statusText}`)
+async function setup(ctx: any) {
+  const state = new Map<string, ProviderState>()
+  const warned = new Set<string>()
+  let disposed = false
+
+  const warnOnce = (key: string, message: string) => {
+    if (warned.has(key)) return
+    warned.add(key)
+    log('warn', message)
+  }
+
+  const refresh = (providerID: string, st: ProviderState) => {
+    if (st.inFlight || disposed) return
+    st.inFlight = (async () => {
+      try {
+        const models = await fetchModels(st.baseURL, st.apiKey)
+        if (Object.keys(models).length === 0) throw new Error('provider returned an empty model list')
+        st.nextAt = Date.now() + st.intervalMs
+        const changed = signature(models) !== signature(st.models)
+        if (changed) await saveCache(providerID, models)
+        st.models = models
+        log('info', `${providerID}: fetched ${Object.keys(models).length} models${changed ? ' (changed, reloading)' : ''}`)
+        if (changed && !disposed) await ctx.model.reload()
+      } catch (error) {
+        // Retry sooner than the normal interval after a failure.
+        st.nextAt = Date.now() + RETRY_AFTER_FAILURE_MS
+        log('error', `${providerID}: discovery failed: ${error instanceof Error ? error.message : String(error)}`)
+      } finally {
+        st.inFlight = undefined
+      }
+    })()
+  }
+
+  const registration = await ctx.model.transform((editor: any) => {
+    for (const record of editor.provider.list()) {
+      const provider = record.provider
+      const settings = provider.settings ?? {}
+      const discovery: DiscoveryOptions | undefined = settings.modelsDiscovery
+      if (!discovery?.enabled) continue
+
+      const providerID = String(provider.id)
+      const baseURL = settings.baseURL
+      if (!baseURL) {
+        warnOnce(`${providerID}:baseURL`, `${providerID}: modelsDiscovery is enabled but no baseURL is set`)
+        continue
+      }
+      const apiKey = settings.apiKey || getAuthKeySync(providerID)
+      if (!apiKey) warnOnce(`${providerID}:apiKey`, `${providerID}: no apiKey in config or auth.json; fetching /models without auth`)
+
+      let st = state.get(providerID)
+      if (!st) {
+        const cached = (loadCacheSync(providerID) ?? {}) as CachedModels
+        st = { models: cached, nextAt: 0, intervalMs: 0, baseURL, apiKey }
+        state.set(providerID, st)
+        log('info', `${providerID}: loaded ${Object.keys(cached).length} cached models`)
+      }
+      st.baseURL = baseURL
+      st.apiKey = apiKey
+      st.intervalMs = Math.max(0.05, discovery.refreshIntervalHours ?? DEFAULT_REFRESH_HOURS) * 3600_000
+
+      let added = 0
+      for (const entry of Object.values(st.models)) {
+        if (!entry?.id) continue
+        if (discovery.textOnly && !isChatModel(entry)) continue
+        // Models defined in opencode.json(c) take precedence over discovered ones.
+        if (editor.get(providerID, entry.id)) continue
+        editor.update(providerID, entry.id, (m: any) => applyToDraft(m, entry))
+        added++
+      }
+      if (added) log('debug', `${providerID}: added ${added} discovered models`)
+
+      if (Date.now() >= st.nextAt) refresh(providerID, st)
     }
+  })
 
-    const data = await response.json() as { data?: Array<{ id: string; name?: string }> }
-    return data.data || []
-  } catch (error) {
-    clearTimeout(timeoutId)
-    throw error
+  // The background service can run for days; re-check periodically.
+  const timer = setInterval(() => {
+    for (const [providerID, st] of state) if (Date.now() >= st.nextAt) refresh(providerID, st)
+  }, RETRY_AFTER_FAILURE_MS)
+  ;(timer as any).unref?.()
+
+  return async () => {
+    disposed = true
+    clearInterval(timer)
+    await registration.dispose()
   }
 }
 
-async function loadCache(providerName: string): Promise<Record<string, any> | null> {
-  const cacheFile = path.join(getCacheDir(), `models-${providerName}.json`)
-  try {
-    const content = await fs.readFile(cacheFile, 'utf8')
-    return JSON.parse(content)
-  } catch {
-    return null
-  }
-}
+// ---------------------------------------------------------------------------
+// OpenCode 1.x compatibility: mutate config.provider[*].models in the config hook.
 
-async function saveCache(providerName: string, models: Record<string, any>): Promise<void> {
-  const cacheDir = getCacheDir()
-  await fs.mkdir(cacheDir, { recursive: true })
-  const cacheFile = path.join(cacheDir, `models-${providerName}.json`)
-  await fs.writeFile(cacheFile, JSON.stringify(models, null, 2), 'utf8')
-}
+export const PersistentModelDiscoveryPlugin = async (_input: any) => ({
+  config: async (config: any) => {
+    for (const [providerID, p] of Object.entries<any>(config.provider || {})) {
+      const discovery: DiscoveryOptions | undefined = p.options?.modelsDiscovery
+      if (!discovery?.enabled || !p.options?.baseURL) continue
+      const apiKey = p.options?.apiKey || getAuthKeySync(providerID)
 
-async function getAuthKey(providerName: string): Promise<string | undefined> {
-  const authPath = path.join(getDataDir(), 'auth.json')
-  try {
-    const content = await fs.readFile(authPath, 'utf8')
-    const auths = JSON.parse(content) as Record<string, { type?: string; key?: string }>
-    const auth = auths[providerName]
-    if (auth?.type === 'api' && auth.key) {
-      return auth.key
-    }
-  } catch {
-    // ignore
-  }
-  return undefined
-}
+      let models = (loadCacheSync(providerID) ?? {}) as CachedModels
+      try {
+        const fresh = (await fetchModels(p.options.baseURL, apiKey)) as CachedModels
+        await saveCache(providerID, fresh)
+        models = fresh
+      } catch (error) {
+        log('error', `${providerID}: discovery failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
 
-export const PersistentModelDiscoveryPlugin: Plugin = async (input: PluginInput) => {
-  const { client } = input
-  const logger = client?.app?.log ? client.app.log.bind(client.app) : console.log
-
-  return {
-    config: async (config: any) => {
-      const providers = config.provider || {}
-
-      for (const [providerName, providerConfig] of Object.entries(providers)) {
-        const p = providerConfig as any
-
-        const discoveryConfig = p.options?.modelsDiscovery
-        if (!discoveryConfig?.enabled) {
-          continue
-        }
-
-        const baseURL = p.options?.baseURL
-        if (!baseURL) {
-          continue
-        }
-
-        const apiKey = p.options?.apiKey || await getAuthKey(providerName)
-        if (!apiKey) {
-          logger?.({ service: 'persistent-model-discovery', level: 'warn', message: `No API key for ${providerName}` })
-          continue
-        }
-
-        // Step 1: Load cached models synchronously
-        const cachedModels = await loadCache(providerName)
-        if (cachedModels && Object.keys(cachedModels).length > 0) {
-          const existingModels = p.models || {}
-          p.models = {
-            ...cachedModels,
-            ...existingModels,  // Config file entries take precedence
-          }
-          logger?.({
-            service: 'persistent-model-discovery',
-            level: 'info',
-            message: `Loaded ${Object.keys(cachedModels).length} cached models for ${providerName}`,
-          })
-        }
-
-        // Step 2: Async background discovery to update cache
-        try {
-          const models = await discoverModels(baseURL, apiKey)
-          const discoveredModels: Record<string, any> = {}
-          
-          for (const model of models) {
-            discoveredModels[model.id] = {
-              id: model.id,
-              name: model.name || model.id,
-            }
-          }
-
-          // Save to cache for next startup
-          await saveCache(providerName, discoveredModels)
-          
-          // Merge into current session (without persisting to config file)
-          const existingModels = p.models || {}
-          p.models = {
-            ...existingModels,
-            ...discoveredModels,
-          }
-
-          logger?.({
-            service: 'persistent-model-discovery',
-            level: 'info',
-            message: `Discovered ${Object.keys(discoveredModels).length} models for ${providerName}`,
-          })
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error)
-          logger?.({
-            service: 'persistent-model-discovery',
-            level: 'error',
-            message: `Failed to discover models for ${providerName}: ${errorMessage}`,
-          })
+      const discovered: Record<string, any> = {}
+      for (const entry of Object.values(models)) {
+        if (discovery.textOnly && !isChatModel(entry)) continue
+        discovered[entry.id] = {
+          id: entry.id,
+          name: entry.name || entry.id,
+          ...(entry.context ? { limit: { context: entry.context, output: entry.output ?? Math.min(32000, entry.context) } } : {}),
+          ...(typeof entry.tools === 'boolean' ? { tool_call: entry.tools } : {}),
         }
       }
-    },
-  }
-}
+      p.models = { ...discovered, ...(p.models || {}) }
+    }
+  },
+})
 
-export default PersistentModelDiscoveryPlugin
+export default Object.freeze({
+  id: PLUGIN_ID,
+  setup,
+  server: PersistentModelDiscoveryPlugin,
+})

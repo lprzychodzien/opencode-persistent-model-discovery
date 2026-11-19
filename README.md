@@ -22,6 +22,19 @@ This plugin implements a **two-phase discovery strategy**:
 
 This means models are always available immediately, while staying up-to-date in the background.
 
+## OpenCode 2.x
+
+OpenCode 2.x changed the plugin API, and this plugin now supports both:
+
+- **2.x**: the default export is `{ id, setup }`. `setup` registers a `context.model.transform` that adds cached models to every provider whose settings include `modelsDiscovery.enabled: true`. It then refreshes `{baseURL}/models` in the background (every 6h by default) and calls `context.model.reload()` when the list changes.
+- **1.x (>= 1.18.29)**: the `server` export keeps the original `config` hook behaviour.
+- In 2.x the config key is `"plugins"` (plural), and a local plugin directory is loaded through its root `index.ts`, not through `package.json` `main`.
+- Models you define in `opencode.json(c)` take precedence over discovered ones.
+- Set `"modelsDiscovery": { "enabled": true, "textOnly": true }` to add only models that output text, skipping image, video, audio and embedding models. `refreshIntervalHours` (default 6) changes how often the list is refreshed.
+- The cache now also stores context/output limits, tool support, input modalities and per-million-token pricing when the provider reports them (OpenRouter-style `/models` fields). Older `{id, name}` caches still load.
+- Activity is logged to `~/.cache/opencode/persistent-model-discovery.log`.
+- After you install or change the plugin, restart the background server with `opencode service restart`.
+
 ## Architecture
 
 ```

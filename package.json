@@ -2,8 +2,12 @@
   "name": "opencode-persistent-model-discovery",
   "version": "0.1.0",
   "description": "OpenCode plugin that persistently discovers and caches AI models from OpenAI-compatible providers",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "type": "module",
+  "main": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "types": "index.ts",
   "repository": {
     "type": "git",
     "url": "https://github.com/lprzychodzien/opencode-persistent-model-discovery"

@@ -12,23 +12,12 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { fetchModels, saveCache, cacheFile as cachePath, getDataDir, isChatModel } from './src/discovery.mjs'
 
 function getConfigDir() {
   const xdgConfig = process.env.XDG_CONFIG_HOME
   if (xdgConfig) return path.join(xdgConfig, 'opencode')
   return path.join(os.homedir(), '.config', 'opencode')
-}
-
-function getDataDir() {
-  const xdgData = process.env.XDG_DATA_HOME
-  if (xdgData) return path.join(xdgData, 'opencode')
-  return path.join(os.homedir(), '.local', 'share', 'opencode')
-}
-
-function getCacheDir() {
-  const xdgCache = process.env.XDG_CACHE_HOME
-  if (xdgCache) return path.join(xdgCache, 'opencode')
-  return path.join(os.homedir(), '.cache', 'opencode')
 }
 
 const CONFIG_CANDIDATES = ['opencode.jsonc', 'opencode.json', 'config.json'].map((name) =>
@@ -81,53 +70,12 @@ async function loadJSON(filePath) {
   }
 }
 
-async function saveJSON(filePath, data) {
-  const dir = path.dirname(filePath)
-  await fs.mkdir(dir, { recursive: true })
-  await fs.writeFile(filePath, JSON.stringify(data, null, 2) + '\n', 'utf8')
-}
-
 function getApiKey(provider, config, authData) {
   const auth = authData?.[provider]
   if (auth?.type === 'api' && auth.key) {
     return auth.key
   }
   return config?.provider?.[provider]?.options?.apiKey
-}
-
-async function discoverModels(baseURL, apiKey) {
-  const url = baseURL.endsWith('/') ? `${baseURL}models` : `${baseURL}/models`
-  console.log(`   URL: ${url}`)
-
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 10000)
-
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        // Some providers (e.g. Surplus) mislabel uncompressed bodies as brotli, breaking decoding
-        'Accept-Encoding': 'identity',
-      },
-    })
-
-    clearTimeout(timeoutId)
-
-    if (!response.ok) {
-      throw new Error(`Discovery failed: ${response.status} ${response.statusText}`)
-    }
-
-    const data = await response.json()
-    return data.data || []
-  } catch (error) {
-    clearTimeout(timeoutId)
-    if (error.name === 'AbortError') {
-      throw new Error('Request timed out after 10 seconds')
-    }
-    throw error
-  }
 }
 
 async function main() {
@@ -138,7 +86,7 @@ async function main() {
     process.exit(1)
   }
 
-  const cacheFile = path.join(getCacheDir(), `models-${provider}.json`)
+  const cacheFile = cachePath(provider)
 
   console.log(`🔍 Model Sync: ${provider}`)
   console.log('=====================\n')
@@ -172,23 +120,18 @@ async function main() {
   console.log(`📡 Fetching models from ${baseURL}...`)
 
   try {
-    const models = await discoverModels(baseURL, apiKey)
-    console.log(`✅ Found ${models.length} models`)
+    console.log(`   URL: ${baseURL.replace(/\/$/, '')}/models`)
+    const models = await fetchModels(baseURL, apiKey)
+    const total = Object.keys(models).length
+    const chat = Object.values(models).filter(isChatModel).length
+    console.log(`✅ Found ${total} models (${chat} output text; set modelsDiscovery.textOnly to show only those)`)
 
-    const cacheData = {}
-    for (const model of models) {
-      cacheData[model.id] = {
-        id: model.id,
-        name: model.name || model.id,
-      }
-    }
+    await saveCache(provider, models)
 
-    await saveJSON(cacheFile, cacheData)
-
-    console.log(`\n💾 Saved ${models.length} models to cache`)
+    console.log(`\n💾 Saved ${total} models to cache`)
     console.log(`📁 Cache file: ${cacheFile}`)
     console.log('\n📝 Note: Models are now cached and will be loaded at startup')
-    console.log('   No changes were made to your opencode.json config file')
+    console.log('   No changes were made to your opencode config file')
   } catch (error) {
     console.error(`\n❌ Error: ${error.message}`)
     process.exit(1)
